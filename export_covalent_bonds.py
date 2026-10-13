@@ -2,12 +2,12 @@ import csv
 from pathlib import Path
 from math import sqrt
 
-from chimerax.atomic import AtomicStructure
+from chimerax.atomic import AtomicStructure # pyright: ignore[reportMissingImports]
 
 
 output_path = Path.home() / "Documents/Classes/SpecialStudies" / "covalent_bonds.csv"
 
-structures = session.models.list(type=AtomicStructure)
+structures = session.models.list(type=AtomicStructure) # pyright: ignore[reportUndefinedVariable]
 
 if not structures:
     raise RuntimeError("No atomic structure is currently open.")
@@ -84,6 +84,6 @@ with output_path.open("w", newline="", encoding="utf-8") as handle:
     writer.writerow(columns)
     writer.writerows(rows)
 
-session.logger.info(
+session.logger.info( # pyright: ignore[reportUndefinedVariable]
     f"Exported {len(rows)} covalent bonds to {output_path}"
 )
