@@ -5,7 +5,7 @@ from math import sqrt
 from chimerax.atomic import AtomicStructure # pyright: ignore[reportMissingImports]
 
 
-output_path = Path.home() / "Documents/Classes/SpecialStudies" / "covalent_bonds.csv"
+output_path = Path.home() / "Documents/Classes/SpecialStudies/csv" / "covalent_bonds.csv"
 
 structures = session.models.list(type=AtomicStructure) # pyright: ignore[reportUndefinedVariable]
 

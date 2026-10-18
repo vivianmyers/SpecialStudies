@@ -10,7 +10,7 @@ from chimerax.hbonds import find_hbonds, rec_angle_slop, rec_dist_slop
 
 # ------------------------------ Configuration ------------------------------
 
-OUTPUT_PATH = Path.home() / "Documents/Classes/SpecialStudies" / "hydrogen_bonds.csv"
+OUTPUT_PATH = Path.home() / "Documents/Classes/SpecialStudies/csv" / "hydrogen_bonds.csv"
 
 # True matches the normal ChimeraX "hbonds" command default by using the
 # recommended distance and angle tolerances.  False applies strict criteria.
@@ -24,7 +24,7 @@ INCLUDE_INTRARESIDUE = True
 # ------------------------------- Utilities ---------------------------------
 
 def model_label(structure):
-    return "#" + ".".join(str(part) for part in structure.id)
+    return ".".join(str(part) for part in structure.id)
 
 
 def distance(coord1, coord2):
