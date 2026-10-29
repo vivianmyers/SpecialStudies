@@ -1,4 +1,4 @@
-"""ChimeraX worker for hydrogenation and bond-table export.
+"""ChimeraX worker for mmCIF inspection, curation, and table export.
 
 This script must run inside ChimeraX. Use run_pipeline.py as the public CLI.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from chimerax.atomic import AtomicStructure
+from chimerax.atomic import AtomicStructure, Residue
 from chimerax.core.commands import run
 from chimerax.hbonds import find_hbonds, rec_angle_slop, rec_dist_slop
 
@@ -22,6 +22,7 @@ WATER_NAMES = {"HOH", "WAT", "DOD"}
 
 ATOM_COLUMNS = [
     "atom_id",
+    "stable_atom_id",
     "model",
     "serial",
     "chain",
@@ -30,6 +31,8 @@ ATOM_COLUMNS = [
     "insertion_code",
     "atom_name",
     "element",
+    "alt_loc",
+    "occupancy",
     "x",
     "y",
     "z",
@@ -109,6 +112,44 @@ def atom_id(structure: AtomicStructure, atom) -> str:
     return f"{model_label(structure)}:{atom.serial_number}"
 
 
+def display_chain_id(chain_id: str) -> str:
+    """Give blank chain IDs a selectable, printable representation."""
+    return chain_id.strip() or "_"
+
+
+def residue_id(residue) -> str:
+    insertion_code = str(getattr(residue, "insertion_code", "")).strip()
+    position = f"{residue.number}{insertion_code}"
+    return f"{display_chain_id(residue.chain_id)}:{position}:{residue.name}"
+
+
+def stable_atom_id(structure: AtomicStructure, atom) -> str:
+    residue = atom.residue
+    alt_loc = str(getattr(atom, "alt_loc", "")).strip() or "."
+    return ":".join(
+        [
+            model_label(structure),
+            residue_id(residue),
+            atom.name,
+            alt_loc,
+        ]
+    )
+
+
+def is_water(residue) -> bool:
+    categories = {atom.structure_category for atom in residue.atoms}
+    return residue.name in Residue.water_res_names or "solvent" in categories
+
+
+def component_class(residue) -> str:
+    categories = {atom.structure_category for atom in residue.atoms}
+    if "ions" in categories:
+        return "ion"
+    if "ligand" in categories:
+        return "ligand"
+    return "non-polymer"
+
+
 def distance(coord1, coord2) -> float:
     return float(np.linalg.norm(np.asarray(coord1) - np.asarray(coord2)))
 
@@ -135,7 +176,7 @@ def atom_fields(prefix, atom) -> dict[str, object]:
     residue = atom.residue
     return {
         f"{prefix}_serial": getattr(atom, "serial_number", ""),
-        f"{prefix}_chain": residue.chain_id,
+        f"{prefix}_chain": display_chain_id(residue.chain_id),
         f"{prefix}_residue_name": residue.name,
         f"{prefix}_residue_number": residue.number,
         f"{prefix}_insertion_code": getattr(residue, "insertion_code", ""),
@@ -148,7 +189,7 @@ def covalent_atom_fields(prefix, atom) -> dict[str, object]:
     residue = atom.residue
     return {
         f"{prefix}_serial": getattr(atom, "serial_number", ""),
-        f"{prefix}_chain": residue.chain_id,
+        f"{prefix}_chain": display_chain_id(residue.chain_id),
         f"{prefix}_residue_name": residue.name,
         f"{prefix}_residue_number": residue.number,
         f"{prefix}_insertion_code": getattr(residue, "insertion_code", ""),
@@ -194,14 +235,17 @@ def export_atoms(structures, output_path: Path) -> int:
             rows.append(
                 {
                     "atom_id": atom_id(structure, atom),
+                    "stable_atom_id": stable_atom_id(structure, atom),
                     "model": model_label(structure),
                     "serial": atom.serial_number,
-                    "chain": residue.chain_id,
+                    "chain": display_chain_id(residue.chain_id),
                     "residue_name": residue.name,
                     "residue_number": residue.number,
                     "insertion_code": getattr(residue, "insertion_code", ""),
                     "atom_name": atom.name,
                     "element": atom.element.name,
+                    "alt_loc": str(getattr(atom, "alt_loc", "")).strip(),
+                    "occupancy": f"{float(atom.occupancy):.3f}",
                     "x": f"{float(x):.4f}",
                     "y": f"{float(y):.4f}",
                     "z": f"{float(z):.4f}",
@@ -344,35 +388,339 @@ def export_hydrogen_bonds(
     return len(rows), without_explicit_hydrogen
 
 
+def chain_class(polymer_types: set[int]) -> str:
+    if polymer_types == {Residue.PT_AMINO}:
+        return "protein"
+    if polymer_types == {Residue.PT_NUCLEIC}:
+        return "nucleic acid"
+    if polymer_types:
+        return "mixed polymer"
+    return "non-polymer"
+
+
+def minimum_residue_distance(residue, atoms) -> float | None:
+    if not atoms or len(residue.atoms) == 0:
+        return None
+    reference = np.asarray([atom.scene_coord for atom in atoms], dtype=float)
+    closest = None
+    for atom in residue.atoms:
+        distances = np.linalg.norm(reference - np.asarray(atom.scene_coord), axis=1)
+        value = float(np.min(distances))
+        closest = value if closest is None else min(closest, value)
+    return closest
+
+
+def inspect_atomic_structure(structure: AtomicStructure) -> dict[str, object]:
+    residues = list(structure.residues)
+    chain_groups: dict[str, list] = {}
+    polymer_atoms: dict[str, list] = {}
+    for residue in residues:
+        chain_id = display_chain_id(residue.chain_id)
+        chain_groups.setdefault(chain_id, []).append(residue)
+        if residue.polymer_type != Residue.PT_NONE:
+            polymer_atoms.setdefault(chain_id, []).extend(list(residue.atoms))
+
+    chain_descriptions = {
+        display_chain_id(chain.chain_id): str(getattr(chain, "description", "") or "")
+        for chain in structure.chains
+    }
+    chains: list[dict[str, object]] = []
+    for chain_id, chain_residues in sorted(chain_groups.items()):
+        polymer = [
+            residue
+            for residue in chain_residues
+            if residue.polymer_type != Residue.PT_NONE
+        ]
+        nonpolymer = [
+            residue
+            for residue in chain_residues
+            if residue.polymer_type == Residue.PT_NONE and not is_water(residue)
+        ]
+        waters = [residue for residue in chain_residues if is_water(residue)]
+        chains.append(
+            {
+                "chain_id": chain_id,
+                "class": chain_class({residue.polymer_type for residue in polymer}),
+                "polymer_residues": len(polymer),
+                "nonpolymer_residues": len(nonpolymer),
+                "water_residues": len(waters),
+                "atoms": sum(len(residue.atoms) for residue in chain_residues),
+                "description": chain_descriptions.get(chain_id, ""),
+            }
+        )
+
+    components: list[dict[str, object]] = []
+    water_residues = []
+    for residue in residues:
+        if residue.polymer_type != Residue.PT_NONE:
+            continue
+        if is_water(residue):
+            water_residues.append(residue)
+            continue
+        attached_chains = set()
+        for atom in residue.atoms:
+            for neighbor in atom.neighbors:
+                if (
+                    neighbor.residue is not residue
+                    and neighbor.residue.polymer_type != Residue.PT_NONE
+                ):
+                    attached_chains.add(display_chain_id(neighbor.residue.chain_id))
+        distances = {
+            chain_id: value
+            for chain_id, atoms in polymer_atoms.items()
+            if (value := minimum_residue_distance(residue, atoms)) is not None
+        }
+        components.append(
+            {
+                "id": residue_id(residue),
+                "chain_id": display_chain_id(residue.chain_id),
+                "residue_name": residue.name,
+                "residue_number": residue.number,
+                "insertion_code": str(
+                    getattr(residue, "insertion_code", "")
+                ).strip(),
+                "class": component_class(residue),
+                "atoms": len(residue.atoms),
+                "distances_to_chains": {
+                    key: round(value, 4) for key, value in distances.items()
+                },
+                "nearest_distance_A": (
+                    round(min(distances.values()), 4) if distances else None
+                ),
+                "covalently_attached_chains": sorted(attached_chains),
+            }
+        )
+    components.sort(
+        key=lambda item: (
+            str(item["chain_id"]),
+            residue_sort_value(item["residue_number"]),
+            str(item["residue_name"]),
+        )
+    )
+
+    warnings: list[str] = []
+    alternate_residues = {
+        residue_id(atom.residue)
+        for atom in structure.atoms
+        if getattr(atom, "num_alt_locs", 0) > 1
+    }
+    if alternate_residues:
+        preview = ", ".join(sorted(alternate_residues)[:8])
+        suffix = " ..." if len(alternate_residues) > 8 else ""
+        warnings.append(
+            f"Alternate locations occur in {len(alternate_residues)} residue(s): "
+            f"{preview}{suffix}"
+        )
+
+    missing_heavy = []
+    for residue in residues:
+        if residue.polymer_type == Residue.PT_NONE:
+            continue
+        try:
+            if residue.is_missing_heavy_template_atoms():
+                missing_heavy.append(residue_id(residue))
+        except RuntimeError:
+            continue
+    if missing_heavy:
+        preview = ", ".join(missing_heavy[:8])
+        suffix = " ..." if len(missing_heavy) > 8 else ""
+        warnings.append(
+            f"Missing heavy atoms detected in {len(missing_heavy)} residue(s): "
+            f"{preview}{suffix}"
+        )
+
+    for chain in structure.chains:
+        missing_count = max(0, chain.num_residues - chain.num_existing_residues)
+        if missing_count:
+            warnings.append(
+                f"Chain {display_chain_id(chain.chain_id)} has "
+                f"{missing_count} unresolved residue position(s)."
+            )
+    if len(structure.bonds) == 0:
+        warnings.append("No covalent bonds were found or inferred on import.")
+    if getattr(structure, "num_coordsets", 1) > 1:
+        warnings.append(
+            f"The model contains {structure.num_coordsets} coordinate sets; "
+            "the active coordinate set will be used for tabular exports."
+        )
+
+    return {
+        "model_id": model_label(structure),
+        "name": structure.name,
+        "atoms": len(structure.atoms),
+        "residues": len(residues),
+        "covalent_bonds": len(structure.bonds),
+        "chains": chains,
+        "components": components,
+        "waters": {
+            "residues": len(water_residues),
+            "atoms": sum(len(residue.atoms) for residue in water_residues),
+        },
+        "warnings": warnings,
+    }
+
+
+def inspection_manifest(input_path: Path, structures) -> dict[str, object]:
+    models = [inspect_atomic_structure(structure) for structure in structures]
+    if len(models) > 1:
+        for model in models:
+            model["warnings"].insert(
+                0,
+                f"The file contains {len(models)} atomic models; select one explicitly.",
+            )
+    return {
+        "schema_version": 1,
+        "input_path": str(input_path),
+        "models": models,
+    }
+
+
+def curate_model(structure: AtomicStructure, job: dict) -> dict[str, object]:
+    selected_chains = set(job["selected_chains"])
+    kept_components = set(job["kept_components"])
+    removed = {"polymer_residues": 0, "components": []}
+
+    residues_to_remove = []
+    for residue in list(structure.residues):
+        if residue.polymer_type != Residue.PT_NONE:
+            keep = display_chain_id(residue.chain_id) in selected_chains
+            if not keep:
+                removed["polymer_residues"] += 1
+        elif is_water(residue):
+            # Water curation is deliberately out of scope. Preserve every
+            # deposited water until a scientifically defensible policy exists.
+            keep = True
+        else:
+            keep = residue_id(residue) in kept_components
+            if not keep:
+                removed["components"].append(residue_id(residue))
+        if not keep:
+            residues_to_remove.append(residue)
+
+    for residue in residues_to_remove:
+        structure.delete_residue(residue)
+    if len(structure.atoms) == 0:
+        raise RuntimeError("Curation removed every atom from the selected model.")
+    return removed
+
+
 def main(session) -> None:
     args = parse_args()
     job = json.loads(args.job.read_text(encoding="utf-8"))
     input_path = Path(job["input_path"])
-    structure_output = Path(job["structure_output"])
-    atom_output = Path(job["atom_output"])
-    covalent_output = Path(job["covalent_output"])
-    hydrogen_output = Path(job["hydrogen_output"])
-
     run(session, f"open {command_path(input_path)}")
     structures = session.models.list(type=AtomicStructure)
     if not structures:
         raise RuntimeError(f"No atomic structure was read from {input_path}")
 
-    run(session, "addh")
-    structures = session.models.list(type=AtomicStructure)
+    action = job.get("action", "curate")
+    if action == "inspect":
+        output_path = Path(job["inspection_output"])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(inspection_manifest(input_path, structures), indent=2),
+            encoding="utf-8",
+        )
+        session.logger.info(f"Wrote structure inspection to {output_path}")
+        return
+    if action != "curate":
+        raise RuntimeError(f"Unsupported worker action: {action}")
+
+    model_number = int(job["model_number"])
+    if model_number < 1 or model_number > len(structures):
+        raise RuntimeError(
+            f"Model {model_number} is unavailable; found {len(structures)} model(s)."
+        )
+    structure = structures[model_number - 1]
+    other_structures = [item for item in structures if item is not structure]
+    if other_structures:
+        session.models.close(other_structures)
+
+    structure_output = Path(job["structure_output"])
+    session_output = Path(job["session_output"])
+    atom_output = Path(job["atom_output"])
+    covalent_output = Path(job["covalent_output"])
+    hydrogen_output = Path(job["hydrogen_output"])
+    report_output = Path(job["report_output"])
+
+    before_atoms = len(structure.atoms)
+    before_residues = len(structure.residues)
+    removed = curate_model(structure, job)
+    retained_before_hydrogenation = len(structure.atoms)
+
+    run(session, f"addh #{model_label(structure)}")
+
+    relax_value = "true" if job["relaxed_hbonds"] else "false"
+    intraresidue_value = "true" if job["include_intraresidue"] else "false"
+    run(
+        session,
+        f"hbonds #{model_label(structure)} interModel false "
+        f"interSubmodel false relax {relax_value} "
+        f"intraRes {intraresidue_value} makePseudobonds true",
+    )
+    hbond_group = structure.pseudobond_group("hydrogen bonds", create_type=None)
+    hbond_pseudobond_count = (
+        len(hbond_group.pseudobonds) if hbond_group is not None else 0
+    )
 
     structure_output.parent.mkdir(parents=True, exist_ok=True)
     run(session, f"save {command_path(structure_output)} format mmcif")
+    run(session, f"save {command_path(session_output)}")
 
-    atom_count = export_atoms(structures, atom_output)
-    covalent_count = export_covalent_bonds(structures, covalent_output)
+    selected_structures = [structure]
+    atom_count = export_atoms(selected_structures, atom_output)
+    covalent_count = export_covalent_bonds(selected_structures, covalent_output)
     hydrogen_count, without_hydrogen = export_hydrogen_bonds(
         session,
-        structures,
+        selected_structures,
         hydrogen_output,
         relaxed_criteria=bool(job["relaxed_hbonds"]),
         include_intraresidue=bool(job["include_intraresidue"]),
     )
+
+    inspection = job.get("inspection", {})
+    inspected_models = inspection.get("models", [])
+    model_warnings = (
+        inspected_models[model_number - 1].get("warnings", [])
+        if model_number <= len(inspected_models)
+        else []
+    )
+    report = {
+        "schema_version": 1,
+        "input_path": str(input_path),
+        "selected_model": model_number,
+        "selected_model_id": model_label(structure),
+        "selected_chains": job["selected_chains"],
+        "kept_components": job["kept_components"],
+        "protonation": job.get("protonation", "ChimeraX addh defaults"),
+        "hbond_criteria": "relaxed" if job["relaxed_hbonds"] else "strict",
+        "include_intraresidue_hbonds": bool(job["include_intraresidue"]),
+        "warnings": model_warnings,
+        "removed": removed,
+        "counts": {
+            "input_atoms": before_atoms,
+            "input_residues": before_residues,
+            "atoms_before_hydrogenation": retained_before_hydrogenation,
+            "exported_atoms": atom_count,
+            "exported_covalent_bonds": covalent_count,
+            "exported_hydrogen_bonds": hydrogen_count,
+            "chimerax_hbond_pseudobonds": hbond_pseudobond_count,
+            "hydrogen_bonds_without_explicit_hydrogen": without_hydrogen,
+        },
+        "outputs": job.get(
+            "final_outputs",
+            {
+                "cleaned_structure": str(structure_output),
+                "chimerax_session": str(session_output),
+                "atoms": str(atom_output),
+                "covalent_bonds": str(covalent_output),
+                "hydrogen_bonds": str(hydrogen_output),
+                "curation_report": str(report_output),
+            },
+        ),
+    }
+    report_output.parent.mkdir(parents=True, exist_ok=True)
+    report_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     session.logger.info(
         f"Pipeline complete for {input_path}: {atom_count} atoms, "
         f"{covalent_count} covalent bonds, "
