@@ -398,27 +398,12 @@ def chain_class(polymer_types: set[int]) -> str:
     return "non-polymer"
 
 
-def minimum_residue_distance(residue, atoms) -> float | None:
-    if not atoms or len(residue.atoms) == 0:
-        return None
-    reference = np.asarray([atom.scene_coord for atom in atoms], dtype=float)
-    closest = None
-    for atom in residue.atoms:
-        distances = np.linalg.norm(reference - np.asarray(atom.scene_coord), axis=1)
-        value = float(np.min(distances))
-        closest = value if closest is None else min(closest, value)
-    return closest
-
-
 def inspect_atomic_structure(structure: AtomicStructure) -> dict[str, object]:
     residues = list(structure.residues)
     chain_groups: dict[str, list] = {}
-    polymer_atoms: dict[str, list] = {}
     for residue in residues:
         chain_id = display_chain_id(residue.chain_id)
         chain_groups.setdefault(chain_id, []).append(residue)
-        if residue.polymer_type != Residue.PT_NONE:
-            polymer_atoms.setdefault(chain_id, []).extend(list(residue.atoms))
 
     chain_descriptions = {
         display_chain_id(chain.chain_id): str(getattr(chain, "description", "") or "")
@@ -457,19 +442,6 @@ def inspect_atomic_structure(structure: AtomicStructure) -> dict[str, object]:
         if is_water(residue):
             water_residues.append(residue)
             continue
-        attached_chains = set()
-        for atom in residue.atoms:
-            for neighbor in atom.neighbors:
-                if (
-                    neighbor.residue is not residue
-                    and neighbor.residue.polymer_type != Residue.PT_NONE
-                ):
-                    attached_chains.add(display_chain_id(neighbor.residue.chain_id))
-        distances = {
-            chain_id: value
-            for chain_id, atoms in polymer_atoms.items()
-            if (value := minimum_residue_distance(residue, atoms)) is not None
-        }
         components.append(
             {
                 "id": residue_id(residue),
@@ -481,13 +453,6 @@ def inspect_atomic_structure(structure: AtomicStructure) -> dict[str, object]:
                 ).strip(),
                 "class": component_class(residue),
                 "atoms": len(residue.atoms),
-                "distances_to_chains": {
-                    key: round(value, 4) for key, value in distances.items()
-                },
-                "nearest_distance_A": (
-                    round(min(distances.values()), 4) if distances else None
-                ),
-                "covalently_attached_chains": sorted(attached_chains),
             }
         )
     components.sort(
@@ -575,10 +540,70 @@ def inspection_manifest(input_path: Path, structures) -> dict[str, object]:
     }
 
 
+def format_curation_report(report: dict[str, object]) -> str:
+    """Render the exported audit information as a readable text report."""
+    lines = [
+        "Protein curation report",
+        "=======================",
+        "",
+        f"Input file: {report['input_path']}",
+        f"Selected model: {report['selected_model']} "
+        f"(ChimeraX #{report['selected_model_id']})",
+        "Selected chains: " + ", ".join(report["selected_chains"]),
+        "Kept components: "
+        + (", ".join(report["kept_components"]) or "none"),
+        f"Solvent handling: {str(report['solvent_handling']).replace('_', ' ')}",
+        f"Protonation: {report['protonation']}",
+        f"Hydrogen-bond criteria: {report['hbond_criteria']}",
+        "Include intra-residue hydrogen bonds: "
+        + ("yes" if report["include_intraresidue_hbonds"] else "no"),
+        "",
+        "Warnings",
+        "--------",
+    ]
+
+    warnings = report["warnings"]
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- none")
+
+    removed = report["removed"]
+    removed_components = removed.get("components", [])
+    lines.extend(
+        [
+            "",
+            "Removed",
+            "-------",
+            f"- Polymer residues: {removed.get('polymer_residues', 0)}",
+            "- Components: "
+            + (", ".join(removed_components) if removed_components else "none"),
+            f"- Solvent residues: {removed.get('solvent_residues', 0)}",
+            f"- Solvent atoms: {removed.get('solvent_atoms', 0)}",
+            "",
+            "Counts",
+            "------",
+        ]
+    )
+    for name, value in report["counts"].items():
+        lines.append(f"- {name.replace('_', ' ').capitalize()}: {value}")
+
+    lines.extend(["", "Output files", "------------"])
+    for name, value in report["outputs"].items():
+        lines.append(f"- {name.replace('_', ' ').capitalize()}: {value}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def curate_model(structure: AtomicStructure, job: dict) -> dict[str, object]:
     selected_chains = set(job["selected_chains"])
     kept_components = set(job["kept_components"])
-    removed = {"polymer_residues": 0, "components": []}
+    removed = {
+        "polymer_residues": 0,
+        "components": [],
+        "solvent_residues": 0,
+        "solvent_atoms": 0,
+    }
 
     residues_to_remove = []
     for residue in list(structure.residues):
@@ -587,8 +612,8 @@ def curate_model(structure: AtomicStructure, job: dict) -> dict[str, object]:
             if not keep:
                 removed["polymer_residues"] += 1
         elif is_water(residue):
-            # Water curation is deliberately out of scope. Preserve every
-            # deposited water until a scientifically defensible policy exists.
+            # Solvent is handled separately with ChimeraX's native
+            # ``delete solvent`` command when the user explicitly requests it.
             keep = True
         else:
             keep = residue_id(residue) in kept_components
@@ -646,6 +671,16 @@ def main(session) -> None:
     before_atoms = len(structure.atoms)
     before_residues = len(structure.residues)
     removed = curate_model(structure, job)
+    if job.get("delete_solvent", False):
+        atoms_before_solvent_deletion = len(structure.atoms)
+        residues_before_solvent_deletion = len(structure.residues)
+        run(session, "delete solvent")
+        removed["solvent_residues"] = (
+            residues_before_solvent_deletion - len(structure.residues)
+        )
+        removed["solvent_atoms"] = (
+            atoms_before_solvent_deletion - len(structure.atoms)
+        )
     retained_before_hydrogenation = len(structure.atoms)
 
     run(session, f"addh #{model_label(structure)}")
@@ -662,6 +697,9 @@ def main(session) -> None:
     hbond_pseudobond_count = (
         len(hbond_group.pseudobonds) if hbond_group is not None else 0
     )
+
+    run(session, f"hide #{model_label(structure)} cartoons")
+    run(session, f"show #{model_label(structure)} atoms")
 
     structure_output.parent.mkdir(parents=True, exist_ok=True)
     run(session, f"save {command_path(structure_output)} format mmcif")
@@ -692,6 +730,9 @@ def main(session) -> None:
         "selected_model_id": model_label(structure),
         "selected_chains": job["selected_chains"],
         "kept_components": job["kept_components"],
+        "solvent_handling": (
+            "delete_all" if job.get("delete_solvent", False) else "keep_all"
+        ),
         "protonation": job.get("protonation", "ChimeraX addh defaults"),
         "hbond_criteria": "relaxed" if job["relaxed_hbonds"] else "strict",
         "include_intraresidue_hbonds": bool(job["include_intraresidue"]),
@@ -720,7 +761,7 @@ def main(session) -> None:
         ),
     }
     report_output.parent.mkdir(parents=True, exist_ok=True)
-    report_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report_output.write_text(format_curation_report(report), encoding="utf-8")
     session.logger.info(
         f"Pipeline complete for {input_path}: {atom_count} atoms, "
         f"{covalent_count} covalent bonds, "

@@ -17,7 +17,6 @@ from typing import Any
 
 SUPPORTED_SUFFIXES = {".cif", ".mmcif"}
 OUTPUT_ROOT = Path("pipeline_output")
-COMPONENT_DISTANCE_A = 4.0
 
 
 def csv_values(value: str | None) -> list[str]:
@@ -110,6 +109,17 @@ def run_chimerax(
         raise RuntimeError(f"ChimeraX failed with exit code {completed.returncode}.")
 
 
+def open_chimerax_gui(chimerax: Path, session_path: Path) -> None:
+    """Open a completed ChimeraX session in a detached GUI process."""
+    subprocess.Popen(
+        [str(chimerax), str(session_path)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def inspect_structure(
     input_path: Path, chimerax: Path, worker: Path
 ) -> dict[str, Any]:
@@ -158,10 +168,7 @@ def render_table(headers: list[str], rows: list[list[object]]) -> str:
     return "\n".join(lines)
 
 
-def print_inspection(
-    inspection: dict[str, Any], model_number: int, selected_chains: list[str] | None = None
-) -> None:
-    selected = set(selected_chains or [])
+def print_inspection(inspection: dict[str, Any], model_number: int) -> None:
     model = model_data(inspection, model_number)
     print(f"\nInput: {inspection['input_path']}")
     print(
@@ -196,27 +203,14 @@ def print_inspection(
         )
     )
 
-    component_rows = []
-    for component in model["components"]:
-        distances = component.get("distances_to_chains", {})
-        relevant = [distances[c] for c in selected if c in distances]
-        distance = min(relevant) if relevant else component.get("nearest_distance_A")
-        component_rows.append(
-            [
-                component["id"],
-                component["class"],
-                component["atoms"],
-                "" if distance is None else f"{distance:.2f}",
-                ",".join(component.get("covalently_attached_chains", [])) or "no",
-            ]
-        )
+    component_rows = [
+        [component["id"], component["class"], component["atoms"]]
+        for component in model["components"]
+    ]
     if component_rows:
         print("\nNon-polymer components")
         print(
-            render_table(
-                ["ID", "CLASS", "ATOMS", "MIN DIST (A)", "COVALENT TO"],
-                component_rows,
-            )
+            render_table(["ID", "CLASS", "ATOMS"], component_rows)
         )
     waters = model["waters"]
     print(f"\nWaters: {waters['residues']} residues, {waters['atoms']} atoms")
@@ -256,23 +250,6 @@ def validate_chain_ids(model: dict[str, Any], chains: list[str]) -> None:
         )
 
 
-def suggested_components(
-    model: dict[str, Any], chains: list[str], distance_cutoff: float
-) -> list[str]:
-    selected = set(chains)
-    suggestions: list[str] = []
-    for component in model["components"]:
-        covalent = set(component.get("covalently_attached_chains", [])) & selected
-        distances = component.get("distances_to_chains", {})
-        near = any(
-            chain in distances and distances[chain] <= distance_cutoff
-            for chain in selected
-        )
-        if covalent or near:
-            suggestions.append(component["id"])
-    return suggestions
-
-
 def resolve_model_selection(inspection: dict[str, Any]) -> int:
     model_count = len(inspection["models"])
     if model_count == 1:
@@ -300,17 +277,12 @@ def resolve_selection(
         raise ValueError("At least one polymer chain must be selected.")
     validate_chain_ids(model, chains)
 
-    component_defaults = suggested_components(
-        model, chains, COMPONENT_DISTANCE_A
-    )
     if model["components"]:
-        print_inspection(inspection, model_number, chains)
-        print(
-            f"\nComponents within {COMPONENT_DISTANCE_A:.1f} A or covalently "
-            "attached are suggested by default."
+        component_value = prompt_value(
+            "Components to retain (comma-separated IDs, or none)", "none"
         )
-        components = csv_values(
-            prompt_value("Components to retain", ",".join(component_defaults))
+        components = (
+            [] if component_value.lower() == "none" else csv_values(component_value)
         )
     else:
         components = []
@@ -325,6 +297,24 @@ def resolve_selection(
     return chains, components
 
 
+def resolve_delete_solvent(model: dict[str, Any]) -> bool:
+    waters = model.get("waters", {})
+    residue_count = int(waters.get("residues", 0))
+    if residue_count == 0:
+        return False
+
+    answer = prompt_value("Delete all solvent molecules?", "yes/no").lower()
+    if answer not in {"y", "yes", "n", "no"}:
+        raise ValueError("Solvent choice must be yes or no.")
+    delete_solvent = answer in {"y", "yes"}
+    if delete_solvent:
+        print(
+            "WARNING: ChimeraX will delete every residue classified as solvent "
+            f"({residue_count} deposited water residue(s) in this model). "
+        )
+    return delete_solvent
+
+
 def output_paths(output_root: Path, stem: str) -> dict[str, Path]:
     result_dir = output_root / stem
     return {
@@ -334,7 +324,7 @@ def output_paths(output_root: Path, stem: str) -> dict[str, Path]:
         "atoms": result_dir / f"{stem}_atoms.csv",
         "covalent": result_dir / f"{stem}_covalent_bonds.csv",
         "hydrogen": result_dir / f"{stem}_hydrogen_bonds.csv",
-        "report": result_dir / f"{stem}_curation.json",
+        "report": result_dir / f"{stem}_curation.txt",
     }
 
 
@@ -347,6 +337,7 @@ def curate_structure(
     model_number: int,
     chains: list[str],
     components: list[str],
+    delete_solvent: bool,
     overwrite: bool,
 ) -> dict[str, Path]:
     stem = input_stem(input_path)
@@ -378,6 +369,7 @@ def curate_structure(
             "model_number": model_number,
             "selected_chains": chains,
             "kept_components": components,
+            "delete_solvent": delete_solvent,
             "structure_output": str(temporary_outputs["structure"]),
             "session_output": str(temporary_outputs["session"]),
             "atom_output": str(temporary_outputs["atoms"]),
@@ -430,10 +422,14 @@ def main(argv: list[str] | None = None) -> int:
         model_number = resolve_model_selection(inspection)
         print_inspection(inspection, model_number)
         chains, components = resolve_selection(inspection, model_number)
+        delete_solvent = resolve_delete_solvent(
+            model_data(inspection, model_number)
+        )
         print("\nCuration selection")
         print(f"- Model: {model_number}")
         print(f"- Polymer chains: {', '.join(chains)}")
-        print(f"- Components: {', '.join(components) if components else 'none'}")
+        print(f"- Non-polymer components: {', '.join(components) if components else 'none'}")
+        print(f"- Solvent: {'delete all' if delete_solvent else 'keep all'}")
 
         destinations = output_paths(OUTPUT_ROOT.resolve(), input_stem(input_path))
         final_keys = (
@@ -450,13 +446,13 @@ def main(argv: list[str] | None = None) -> int:
             print("\nExisting output will be replaced:")
             for path in existing:
                 print(f"- {path}")
-            replace = prompt_value("Replace existing output?", "no").lower()
+            replace = prompt_value("Replace existing output?", "yes/no").lower()
             if replace not in {"y", "yes"}:
                 print("Cancelled; no output was changed.")
                 return 0
             overwrite = True
 
-        answer = prompt_value("Continue?", "yes").lower()
+        answer = prompt_value("Continue?", "yes/no").lower()
         if answer not in {"y", "yes"}:
             print("Cancelled; no output was changed.")
             return 0
@@ -469,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
             model_number=model_number,
             chains=chains,
             components=components,
+            delete_solvent=delete_solvent,
             overwrite=overwrite,
         )
     except (FileExistsError, OSError, RuntimeError, ValueError) as error:
@@ -478,6 +475,17 @@ def main(argv: list[str] | None = None) -> int:
     print("\nCreated curated dataset:")
     for key in ("structure", "session", "atoms", "covalent", "hydrogen", "report"):
         print(f"- {destinations[key]}")
+
+    open_answer = prompt_value("Open session in ChimeraX?", "yes/no").lower()
+    if open_answer not in {"y", "yes", "n", "no"}:
+        print("warning: GUI choice must be yes or no; session was not opened.", file=sys.stderr)
+    elif open_answer in {"y", "yes"}:
+        try:
+            open_chimerax_gui(chimerax, destinations["session"])
+        except OSError as error:
+            print(f"warning: could not open ChimeraX GUI: {error}", file=sys.stderr)
+        else:
+            print(f"Opened ChimeraX GUI with {destinations['session']}")
     return 0
 
 
