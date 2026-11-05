@@ -1,7 +1,5 @@
-"""ChimeraX worker for mmCIF inspection, curation, and table export.
+"""ChimeraX pipeline worker script"""
 
-This script must run inside ChimeraX. Use run_pipeline.py as the public CLI.
-"""
 
 from __future__ import annotations
 

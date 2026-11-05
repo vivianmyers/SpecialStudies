@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect and curate PDB mmCIF structures with UCSF ChimeraX."""
-
+"""CLI interface and pipeline manager/runner"""
 from __future__ import annotations
 
 import argparse
