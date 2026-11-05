@@ -14,7 +14,7 @@ python3 run_pipeline.py cif/7HVP.cif
 After the outputs are created, the user may open the
 `.cxs` session in the ChimeraX GUI.
 
-The prototype uses these fixed defaults:
+The pipeline uses these fixed defaults:
 
 - Output directory: `pipeline_output/`
 - ChimeraX recommended H-bond tolerances
@@ -43,8 +43,7 @@ for later analysis.
 
 The plain-text report records all selections, warnings, removed contents,
 processing choices, and output counts, including the number of ChimeraX H-bond
-pseudobonds. Missing residues or atoms are reported but are not repaired in
-this prototype. Alternate locations are preserved and reported.
+pseudobonds. Missing residues or atoms are reported but are not repaired.
 
 ## Pipeline order
 
@@ -64,6 +63,42 @@ has this form:
 "<ChimeraX executable>" --nogui --exit \
   --script "<project>/chimerax_pipeline_worker.py --job <temporary-job.json>"
 ```
+
+### Adding hydrogens
+
+After the selected model has been curated and any excluded chains,
+components, or solvent molecules have been removed, the pipeline adds
+hydrogen atoms with ChimeraX's standard protonation behavior. For model `#1`,
+the exact ChimeraX command is:
+
+```chimerax
+addh #1
+```
+
+ChimeraX uses its default settings to determine protonation states and hydrogen placement from the
+retained structure. Hydrogenation occurs before H-bond detection.
+
+The added hydrogens become part of the curated atomic model. They are saved in
+the `*_cleaned.cif` structure and `*_curated.cxs` session and are included in
+the `*_atoms.csv` and `*_covalent_bonds.csv` tables. The curation report records
+the atom count before hydrogenation and the final exported atom count.
+
+### H-bonds
+
+```chimerax
+hbonds #1 interModel false interSubmodel false relax true intraRes true makePseudobonds true
+```
+
+Hydrogen bonds are identified after ChimeraX adds explicit hydrogen atoms. The pipeline uses ChimeraX's donor and acceptor typing and its recommended relaxed distance and angle tolerances. Only bonds within the selected model are considered; bonds between models or submodels are excluded. Intra-residue hydrogen bonds are included by default.
+
+ChimeraX stores the detected H-bonds as noncovalent pseudobonds in the
+`*_curated.cxs` session so they can be displayed in GUI. These are
+not covalent bonds, so they are not written to the mmCIF bond table. The pipeline writes each
+donor--acceptor pair to `*_hydrogen_bonds.csv`.
+
+For each pair, the export records the donor, acceptor, and associated donor
+hydrogen; the donor--acceptor and hydrogen--acceptor distances; and the
+donor--hydrogen--acceptor angle. 
 
 ## Citations
 
