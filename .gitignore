@@ -1,6 +1,7 @@
 covalent_bonds.csv
 cif/
 csv/
+results/
 pipeline_output/
 .DS_Store
 
