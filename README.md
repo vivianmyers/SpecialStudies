@@ -17,9 +17,6 @@ After the outputs are created, the user may open the
 The pipeline uses these fixed defaults:
 
 - Output directory: `pipeline_output/`
-- ChimeraX recommended H-bond tolerances
-- Intra-residue H-bonds included
-- Solvent handling
 
 ## Outputs
 
