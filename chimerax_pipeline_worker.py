@@ -1,11 +1,15 @@
 """ChimeraX pipeline worker script"""
 
+#add comments
 
 from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
+import shutil
+import tempfile
 from math import acos, degrees, sqrt
 from pathlib import Path
 
@@ -14,6 +18,7 @@ import numpy as np
 from chimerax.atomic import AtomicStructure, Residue
 from chimerax.core.commands import run
 from chimerax.hbonds import find_hbonds, rec_angle_slop, rec_dist_slop
+from chimerax.mmcif import get_cif_tables
 
 
 WATER_NAMES = {"HOH", "WAT", "DOD"}
@@ -38,6 +43,7 @@ ATOM_COLUMNS = [
 ]
 
 COVALENT_COLUMNS = [
+    "bond_id",
     "model",
     "atom1_serial",
     "atom1_chain",
@@ -56,6 +62,9 @@ COVALENT_COLUMNS = [
     "bond_length_A",
     "same_residue",
     "contains_hydrogen",
+    "bond_order",
+    "is_aromatic",
+    "annotation_source",
 ]
 
 HYDROGEN_COLUMNS = [
@@ -260,7 +269,58 @@ def export_atoms(structures, output_path: Path) -> int:
     return len(rows)
 
 
-def export_covalent_bonds(structures, output_path: Path) -> int:
+def read_bond_definitions(input_path: Path) -> dict:
+    """Read component templates from the original input, before ChimeraX saves it."""
+    if input_path.suffix.lower() == ".gz":
+        with tempfile.TemporaryDirectory(prefix="bond_definitions_") as directory:
+            unpacked = Path(directory) / "input.cif"
+            with gzip.open(input_path, "rb") as source, unpacked.open("wb") as target:
+                shutil.copyfileobj(source, target)
+            return read_bond_definitions(unpacked)
+
+    tables = get_cif_tables(str(input_path), ["chem_comp_bond"])
+    definitions = {}
+    for table in tables:
+        if not table:
+            continue
+        for component, name1, name2, order, aromatic in table.fields(
+            ["comp_id", "atom_id_1", "atom_id_2", "value_order", "pdbx_aromatic_flag"],
+            allow_missing_fields=True,
+        ):
+            key = (component, frozenset((name1, name2)))
+            annotation = (
+                {"sing": "single", "doub": "double", "trip": "triple",
+                 "arom": "aromatic", "delo": "delocalized"}.get(order.lower(), "unknown"),
+                {"Y": "yes", "N": "no"}.get(aromatic.upper(), "unknown"),
+            )
+            # Conflicting template rows must not silently choose an order.
+            if key in definitions and definitions[key] != annotation:
+                annotation = ("unknown", "unknown")
+            definitions[key] = annotation
+    return definitions
+
+
+def covalent_annotation(atom1, atom2, definitions) -> dict[str, str]:
+    """Annotate existing connectivity; never infer bond order from distance."""
+    order, aromatic, source = "unknown", "unknown", "unknown"
+    if atom1.residue is atom2.residue:
+        key = (atom1.residue.name, frozenset((atom1.name, atom2.name)))
+        if key in definitions:
+            order, aromatic = definitions[key]
+            source = "input_chem_comp_bond"
+    # Covers added hydrogens whose names do not match the component template.
+    if source == "unknown" and (
+        atom1.element.number == 1 or atom2.element.number == 1
+    ):
+        order, aromatic, source = "single", "no", "hydrogen_single_bond_rule"
+    return {
+        "bond_order": order,
+        "is_aromatic": aromatic,
+        "annotation_source": source,
+    }
+
+
+def export_covalent_bonds(structures, output_path: Path, definitions) -> tuple[int, int]:
     rows: list[dict[str, object]] = []
     for structure in structures:
         for bond in structure.bonds:
@@ -269,8 +329,12 @@ def export_covalent_bonds(structures, output_path: Path) -> int:
             length = sqrt(sum(float(component) ** 2 for component in delta))
 
             row: dict[str, object] = {"model": model_label(structure)}
+            row["bond_id"] = "--".join(sorted(
+                [stable_atom_id(structure, atom1), stable_atom_id(structure, atom2)]
+            ))
             row.update(covalent_atom_fields("atom1", atom1))
             row.update(covalent_atom_fields("atom2", atom2))
+            row.update(covalent_annotation(atom1, atom2, definitions))
             row.update(
                 {
                     "bond_length_A": f"{length:.4f}",
@@ -298,7 +362,7 @@ def export_covalent_bonds(structures, output_path: Path) -> int:
         writer = csv.DictWriter(output_file, fieldnames=COVALENT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
-    return len(rows)
+    return len(rows), sum(row["bond_order"] == "unknown" for row in rows)
 
 
 def export_hydrogen_bonds(
@@ -705,7 +769,10 @@ def main(session) -> None:
 
     selected_structures = [structure]
     atom_count = export_atoms(selected_structures, atom_output)
-    covalent_count = export_covalent_bonds(selected_structures, covalent_output)
+    definitions = read_bond_definitions(input_path)
+    covalent_count, unknown_orders = export_covalent_bonds(
+        selected_structures, covalent_output, definitions
+    )
     hydrogen_count, without_hydrogen = export_hydrogen_bonds(
         session,
         selected_structures,
@@ -721,6 +788,14 @@ def main(session) -> None:
         if model_number <= len(inspected_models)
         else []
     )
+    if unknown_orders:
+        warning = (
+            f"{unknown_orders} covalent bond(s) have unknown bond order. "
+            "Annotations use input component templates and a single-bond rule for "
+            "hydrogens; inter-residue bonds and unmatched heavy-atom bonds remain unknown."
+        )
+        model_warnings = [*model_warnings, warning]
+        session.logger.warning(warning)
     report = {
         "schema_version": 1,
         "input_path": str(input_path),
@@ -742,6 +817,7 @@ def main(session) -> None:
             "atoms_before_hydrogenation": retained_before_hydrogenation,
             "exported_atoms": atom_count,
             "exported_covalent_bonds": covalent_count,
+            "covalent_bonds_with_unknown_order": unknown_orders,
             "exported_hydrogen_bonds": hydrogen_count,
             "chimerax_hbond_pseudobonds": hbond_pseudobond_count,
             "hydrogen_bonds_without_explicit_hydrogen": without_hydrogen,
@@ -768,4 +844,5 @@ def main(session) -> None:
     )
 
 
-main(session)
+if "session" in globals():
+    main(session)
